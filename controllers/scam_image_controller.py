@@ -41,6 +41,11 @@ class ScamImageController:
             10,
         )
         self.image_burst_scan_enabled = getattr(Config, "SCAM_IMAGE_BURST_SCAN_ENABLED", True)
+        self.image_burst_window_seconds = getattr(
+            Config,
+            "SCAM_IMAGE_BURST_WINDOW_SECONDS",
+            max(self.cross_channel_window_seconds, 70),
+        )
         self.image_burst_ignored_channel_ids = set(getattr(Config, "IMAGE_REACTION_CHANNELS", []))
         self.image_burst_ignored_channel_ids.update(getattr(Config, "ART_CHALLENGE_CHANNELS", []))
         self.image_burst_delete_messages = getattr(Config, "SCAM_IMAGE_BURST_DELETE_MESSAGES", False)
@@ -49,6 +54,7 @@ class ScamImageController:
         self._image_burst_entries = []
         self._image_burst_confirmation_keys = set()
         self._image_burst_suppressed_until = {}
+        self._image_burst_settings_loaded_guilds = set()
         self.allowed_url_content_types = {"image/jpeg", "image/png", "image/webp", "image/bmp", "image/x-ms-bmp"}
 
     def register_commands(self):
@@ -63,6 +69,7 @@ class ScamImageController:
                 await interaction.response.send_message("You need moderation permissions.", ephemeral=True)
                 return
 
+            await self._load_image_burst_settings(interaction.guild, force=True)
             counts = await asyncio.to_thread(self.manager.counts)
             embed = discord.Embed(title="Scam Image Detection", color=discord.Color.blurple())
             embed.add_field(name="Enabled", value=str(self.enabled), inline=True)
@@ -78,6 +85,7 @@ class ScamImageController:
                 name="Repeated Burst Actions",
                 value=(
                     f"scan={self.image_burst_scan_enabled}, "
+                    f"window={self.image_burst_window_seconds}s, "
                     f"timeout={self.image_burst_timeout_enabled} "
                     f"({self.image_burst_timeout_seconds}s), "
                     f"delete={self.image_burst_delete_messages}"
@@ -274,6 +282,103 @@ class ScamImageController:
                 ephemeral=True,
             )
 
+        @group.command(name="image_timeline", description="Inspect recent image timing across server channels")
+        @app_commands.describe(
+            user="User to inspect; leave empty for all users",
+            minutes="How far back to inspect, max 120",
+            per_channel_limit="Messages to inspect per channel, max 100",
+            include_ignored="Include configured image/art channels",
+            post_to_modlog="Post the report to the configured moderation log channel",
+        )
+        async def image_timeline(
+            interaction: discord.Interaction,
+            user: Optional[discord.Member] = None,
+            minutes: app_commands.Range[int, 1, 120] = 10,
+            per_channel_limit: app_commands.Range[int, 1, 100] = 50,
+            include_ignored: bool = False,
+            post_to_modlog: bool = False,
+        ):
+            if not await self.can_manage_scam_images(interaction):
+                await interaction.response.send_message("You need moderation permissions.", ephemeral=True)
+                return
+            if not interaction.guild:
+                await interaction.response.send_message("Run this in a server.", ephemeral=True)
+                return
+
+            await interaction.response.defer(ephemeral=True)
+            await self._load_image_burst_settings(interaction.guild)
+            report = await self._build_image_timeline_report(
+                interaction.guild,
+                requester=interaction.user,
+                user=user,
+                minutes=minutes,
+                per_channel_limit=per_channel_limit,
+                include_ignored=include_ignored,
+            )
+            if post_to_modlog:
+                log_channel = await self._get_moderation_log_channel(interaction.guild)
+                if not log_channel:
+                    await interaction.followup.send(
+                        "No moderation log channel is configured.",
+                        ephemeral=True,
+                    )
+                    return
+                try:
+                    await log_channel.send(embed=report)
+                except discord.Forbidden:
+                    await interaction.followup.send(
+                        f"I can't post to {log_channel.mention}.",
+                        ephemeral=True,
+                    )
+                    return
+                except discord.HTTPException as e:
+                    await interaction.followup.send(
+                        f"Could not post the image timeline report: `{e}`",
+                        ephemeral=True,
+                    )
+                    return
+                await interaction.followup.send(
+                    f"Image timeline report posted to {log_channel.mention}.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.followup.send(embed=report, ephemeral=True)
+
+        @group.command(name="burst_config", description="View or update repeated-image burst actions")
+        @app_commands.describe(
+            scan_enabled="Enable repeated-image burst scanning",
+            window_seconds="Repeated-image burst window in seconds",
+            delete_messages="Delete burst messages after an alert",
+            timeout_enabled="Timeout users after a burst alert",
+            timeout_seconds="Timeout duration in seconds",
+        )
+        async def burst_config(
+            interaction: discord.Interaction,
+            scan_enabled: Optional[bool] = None,
+            window_seconds: Optional[app_commands.Range[int, 5, 600]] = None,
+            delete_messages: Optional[bool] = None,
+            timeout_enabled: Optional[bool] = None,
+            timeout_seconds: Optional[app_commands.Range[int, 1, 86400]] = None,
+        ):
+            if not await self.can_manage_scam_images(interaction):
+                await interaction.response.send_message("You need moderation permissions.", ephemeral=True)
+                return
+            if not interaction.guild:
+                await interaction.response.send_message("Run this in a server.", ephemeral=True)
+                return
+
+            await interaction.response.defer(ephemeral=True)
+            updates = {
+                "scam_image_burst_scan_enabled": scan_enabled,
+                "scam_image_burst_window_seconds": window_seconds,
+                "scam_image_burst_delete_messages": delete_messages,
+                "scam_image_burst_timeout_enabled": timeout_enabled,
+                "scam_image_burst_timeout_seconds": timeout_seconds,
+            }
+            changed = await self._save_image_burst_settings(interaction.guild, updates)
+            embed = await self._image_burst_settings_embed(interaction.guild, changed=changed)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
         @group.command(name="list", description="List scam image signatures")
         async def list_signatures(
             interaction: discord.Interaction,
@@ -347,6 +452,307 @@ class ScamImageController:
         if any(role_id and discord.utils.get(interaction.user.roles, id=role_id) for role_id in role_ids):
             return True
         return False
+
+    async def _load_image_burst_settings(self, guild: Optional[discord.Guild], *, force: bool = False):
+        if not guild:
+            return
+        guild_id = str(guild.id)
+        if not force and guild_id in self._image_burst_settings_loaded_guilds:
+            return
+        moderation_manager = self._get_moderation_manager()
+        if not moderation_manager:
+            return
+
+        self.image_burst_scan_enabled = self._coerce_bool(
+            await moderation_manager.get_moderation_setting(
+                guild_id,
+                "scam_image_burst_scan_enabled",
+                self.image_burst_scan_enabled,
+            ),
+            self.image_burst_scan_enabled,
+        )
+        self.image_burst_window_seconds = self._coerce_int(
+            await moderation_manager.get_moderation_setting(
+                guild_id,
+                "scam_image_burst_window_seconds",
+                self.image_burst_window_seconds,
+            ),
+            self.image_burst_window_seconds,
+        )
+        self.image_burst_delete_messages = self._coerce_bool(
+            await moderation_manager.get_moderation_setting(
+                guild_id,
+                "scam_image_burst_delete_messages",
+                self.image_burst_delete_messages,
+            ),
+            self.image_burst_delete_messages,
+        )
+        self.image_burst_timeout_enabled = self._coerce_bool(
+            await moderation_manager.get_moderation_setting(
+                guild_id,
+                "scam_image_burst_timeout_enabled",
+                self.image_burst_timeout_enabled,
+            ),
+            self.image_burst_timeout_enabled,
+        )
+        self.image_burst_timeout_seconds = self._coerce_int(
+            await moderation_manager.get_moderation_setting(
+                guild_id,
+                "scam_image_burst_timeout_seconds",
+                self.image_burst_timeout_seconds,
+            ),
+            self.image_burst_timeout_seconds,
+        )
+        self._image_burst_settings_loaded_guilds.add(guild_id)
+
+    async def _save_image_burst_settings(self, guild: discord.Guild, updates: dict) -> list[str]:
+        moderation_manager = self._get_moderation_manager()
+        changed = []
+        for setting_name, value in updates.items():
+            if value is None:
+                continue
+            if moderation_manager:
+                saved = await moderation_manager.set_moderation_setting(str(guild.id), setting_name, value)
+                if not saved:
+                    logger.warning("Could not save scam image burst setting %s for guild %s", setting_name, guild.id)
+                    continue
+            setattr(self, self._image_burst_setting_attribute(setting_name), value)
+            changed.append(setting_name)
+        self._image_burst_settings_loaded_guilds.discard(str(guild.id))
+        await self._load_image_burst_settings(guild, force=True)
+        return changed
+
+    async def _image_burst_settings_embed(self, guild: discord.Guild, *, changed: list[str]) -> discord.Embed:
+        await self._load_image_burst_settings(guild, force=True)
+        embed = discord.Embed(title="Repeated Image Burst Config", color=discord.Color.blurple())
+        embed.add_field(name="Scan Enabled", value=str(self.image_burst_scan_enabled), inline=True)
+        embed.add_field(name="Window", value=f"{self.image_burst_window_seconds}s", inline=True)
+        embed.add_field(name="Delete Messages", value=str(self.image_burst_delete_messages), inline=True)
+        embed.add_field(name="Timeout Enabled", value=str(self.image_burst_timeout_enabled), inline=True)
+        embed.add_field(name="Timeout Duration", value=f"{self.image_burst_timeout_seconds}s", inline=True)
+        if changed:
+            labels = [name.replace("scam_image_burst_", "").replace("_", " ") for name in changed]
+            embed.add_field(name="Updated", value=", ".join(labels), inline=False)
+        else:
+            embed.add_field(name="Updated", value="No changes; showing current config.", inline=False)
+        return embed
+
+    def _image_burst_setting_attribute(self, setting_name: str) -> str:
+        return {
+            "scam_image_burst_scan_enabled": "image_burst_scan_enabled",
+            "scam_image_burst_window_seconds": "image_burst_window_seconds",
+            "scam_image_burst_delete_messages": "image_burst_delete_messages",
+            "scam_image_burst_timeout_enabled": "image_burst_timeout_enabled",
+            "scam_image_burst_timeout_seconds": "image_burst_timeout_seconds",
+        }[setting_name]
+
+    def _coerce_bool(self, value, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() == "true"
+        return default
+
+    def _coerce_int(self, value, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    async def _build_image_timeline_report(
+        self,
+        guild: discord.Guild,
+        *,
+        requester: discord.Member,
+        user: Optional[discord.Member],
+        minutes: int,
+        per_channel_limit: int,
+        include_ignored: bool,
+    ) -> discord.Embed:
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(minutes=minutes)
+        bot_member = guild.me
+        entries = []
+        scanned_channels = 0
+        skipped_channels = 0
+
+        for channel in guild.text_channels:
+            if not include_ignored and channel.id in self.image_burst_ignored_channel_ids:
+                continue
+            if bot_member:
+                permissions = channel.permissions_for(bot_member)
+                if not permissions.view_channel or not permissions.read_message_history:
+                    skipped_channels += 1
+                    continue
+            requester_permissions = channel.permissions_for(requester)
+            if not requester_permissions.view_channel or not requester_permissions.read_message_history:
+                skipped_channels += 1
+                continue
+            try:
+                async for message in channel.history(limit=per_channel_limit, after=since, oldest_first=False):
+                    if user and message.author.id != user.id:
+                        continue
+                    for attachment in message.attachments:
+                        content_type = (getattr(attachment, "content_type", None) or "").lower()
+                        if not self.manager.is_supported_image(attachment.filename) and not content_type.startswith("image/"):
+                            continue
+                        entries.append(
+                            {
+                                "created_at": message.created_at,
+                                "author_id": str(message.author.id),
+                                "author": message.author,
+                                "channel_id": str(channel.id),
+                                "channel": channel,
+                                "message": message,
+                                "filename": attachment.filename,
+                                "size": int(getattr(attachment, "size", 0) or 0),
+                                "width": getattr(attachment, "width", None),
+                                "height": getattr(attachment, "height", None),
+                                "content_type": content_type or "unknown",
+                            }
+                        )
+                scanned_channels += 1
+            except discord.Forbidden:
+                skipped_channels += 1
+            except discord.HTTPException as e:
+                skipped_channels += 1
+                logger.warning("Could not inspect image timeline history for %s: %s", channel, e)
+
+        entries.sort(key=lambda item: item["created_at"])
+        previous_entry = None
+        for entry in entries:
+            entry["delta_seconds"] = None
+            if previous_entry:
+                entry["delta_seconds"] = max(
+                    (entry["created_at"] - previous_entry["created_at"]).total_seconds(),
+                    0,
+                )
+            previous_entry = entry
+        title = "Image Timeline"
+        description = f"{minutes} minutes across server channels"
+        if user:
+            description = f"{user.mention} image posts in the last {minutes} minutes"
+        embed = discord.Embed(title=title, description=description, color=discord.Color.blurple())
+        embed.add_field(
+            name="Scope",
+            value=(
+                f"Images: `{len(entries)}`\n"
+                f"Channels scanned: `{scanned_channels}`\n"
+                f"Channels skipped: `{skipped_channels}`\n"
+                f"Ignored channels: `{'included' if include_ignored else 'excluded'}`"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="Unique",
+            value=(
+                f"Users: `{len({entry['author_id'] for entry in entries})}`\n"
+                f"Channels: `{len({entry['channel_id'] for entry in entries})}`\n"
+                f"Files: `{len({entry['filename'] for entry in entries})}`"
+            ),
+            inline=True,
+        )
+
+        if not entries:
+            embed.add_field(name="Timeline", value="No image attachments found.", inline=False)
+            return embed
+
+        timeline_lines = []
+        for entry in entries[-12:]:
+            delta = "first" if entry["delta_seconds"] is None else f"+{entry['delta_seconds']:.1f}s"
+            dimensions = self._format_image_dimensions(entry)
+            timeline_lines.append(
+                (
+                    f"`{delta}` {entry['author'].mention} in {entry['channel'].mention} - "
+                    f"`{entry['filename']}` {entry['size']} bytes {dimensions}"
+                )
+            )
+        embed.add_field(name="Timeline", value=self._truncate_embed_value("\n".join(timeline_lines)), inline=False)
+
+        metadata_lines = self._image_timeline_metadata_groups(entries)
+        if metadata_lines:
+            embed.add_field(
+                name="Repeated Metadata",
+                value=self._truncate_embed_value("\n".join(metadata_lines)),
+                inline=False,
+            )
+
+        burst_lines = self._image_timeline_burst_candidates(entries)
+        if burst_lines:
+            embed.add_field(
+                name="Burst Candidates",
+                value=self._truncate_embed_value("\n".join(burst_lines)),
+                inline=False,
+            )
+
+        latest = entries[-1]["message"]
+        embed.add_field(name="Latest Image", value=f"[Open message]({latest.jump_url})", inline=True)
+        return embed
+
+    def _format_image_dimensions(self, entry: dict) -> str:
+        if entry.get("width") and entry.get("height"):
+            return f"{entry['width']}x{entry['height']}"
+        return "unknown-size"
+
+    def _image_timeline_metadata_groups(self, entries: list[dict]) -> list[str]:
+        groups = {}
+        for entry in entries:
+            key = (
+                entry.get("size"),
+                entry.get("width"),
+                entry.get("height"),
+                entry.get("content_type"),
+            )
+            groups.setdefault(key, []).append(entry)
+
+        lines = []
+        for key, group in sorted(groups.items(), key=lambda item: len(item[1]), reverse=True):
+            if len(group) < 2:
+                continue
+            channel_count = len({entry["channel_id"] for entry in group})
+            if channel_count < 2:
+                continue
+            size, width, height, content_type = key
+            dimensions = f"{width}x{height}" if width and height else "unknown-size"
+            lines.append(
+                f"`{len(group)}` images in `{channel_count}` channels - {size} bytes {dimensions} `{content_type}`"
+            )
+            if len(lines) >= 5:
+                break
+        return lines
+
+    def _image_timeline_burst_candidates(self, entries: list[dict]) -> list[str]:
+        lines = []
+        by_user = {}
+        for entry in entries:
+            by_user.setdefault(entry["author_id"], []).append(entry)
+
+        for user_entries in by_user.values():
+            user_entries.sort(key=lambda item: item["created_at"])
+            for start_index, start in enumerate(user_entries):
+                window = [
+                    entry
+                    for entry in user_entries[start_index:]
+                    if (entry["created_at"] - start["created_at"]).total_seconds() <= self.image_burst_window_seconds
+                ]
+                channel_count = len({entry["channel_id"] for entry in window})
+                if len(window) >= self.cross_channel_threshold and channel_count >= self.cross_channel_threshold:
+                    span = (window[-1]["created_at"] - window[0]["created_at"]).total_seconds()
+                    lines.append(
+                        (
+                            f"{start['author'].mention}: `{len(window)}` images across "
+                            f"`{channel_count}` channels in `{span:.1f}s`"
+                        )
+                    )
+                    break
+            if len(lines) >= 5:
+                break
+        return lines
+
+    def _truncate_embed_value(self, value: str, limit: int = 1024) -> str:
+        if len(value) <= limit:
+            return value
+        return value[: limit - 3] + "..."
 
     async def scan_message(
         self,
@@ -441,18 +847,20 @@ class ScamImageController:
         )
 
     async def _maybe_send_repeated_image_burst_alert(self, message: discord.Message, attachment):
+        if not message.guild:
+            return
+        await self._load_image_burst_settings(message.guild)
         if (
-            not message.guild
-            or not self.image_burst_scan_enabled
+            not self.image_burst_scan_enabled
             or not self.manager.is_supported_image(attachment.filename)
             or message.channel.id in self.image_burst_ignored_channel_ids
             or self.cross_channel_threshold <= 1
-            or self.cross_channel_window_seconds <= 0
+            or self.image_burst_window_seconds <= 0
         ):
             return
 
         now = datetime.utcnow()
-        window_start = now - timedelta(seconds=self.cross_channel_window_seconds)
+        window_start = now - timedelta(seconds=self.image_burst_window_seconds)
         self._image_burst_entries = [
             entry for entry in self._image_burst_entries if entry["created_at"] >= window_start
         ]
@@ -532,7 +940,7 @@ class ScamImageController:
                     if confirmed.get("message_id")
                 ],
                 threshold=self.cross_channel_threshold,
-                window_seconds=self.cross_channel_window_seconds,
+                window_seconds=self.image_burst_window_seconds,
                 cooldown_minutes=self.cross_channel_alert_cooldown_minutes,
                 alert_kind="repeated_image_burst",
             )
@@ -545,7 +953,7 @@ class ScamImageController:
                 message,
                 confirmed_entries,
                 threshold=self.cross_channel_threshold,
-                window_seconds=self.cross_channel_window_seconds,
+                window_seconds=self.image_burst_window_seconds,
                 match_kind=match_kind,
                 actions=["Actions pending"],
             )
@@ -583,7 +991,7 @@ class ScamImageController:
                 message,
                 confirmed_entries,
                 threshold=self.cross_channel_threshold,
-                window_seconds=self.cross_channel_window_seconds,
+                window_seconds=self.image_burst_window_seconds,
                 match_kind=match_kind,
                 actions=action_results,
             )
